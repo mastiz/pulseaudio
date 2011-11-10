@@ -1197,6 +1197,56 @@ static DBusHandlerResult filter_cb(DBusConnection *bus, DBusMessage *m, void *us
                 }
                 break;
         }
+    } else if (dbus_message_is_signal(m, "org.bluez.AudioSource", "PropertyChanged")) {
+        const char *key;
+        DBusMessageIter iter;
+        DBusMessageIter variant;
+        pa_bt_audio_state_t state = PA_BT_AUDIO_STATE_INVALID;
+
+        if (!dbus_message_iter_init(m, &iter)) {
+            pa_log("Failed to parse PropertyChanged: %s", err.message);
+            goto fail;
+        }
+
+        if (dbus_message_iter_get_arg_type(&iter) != DBUS_TYPE_STRING) {
+            pa_log("Property name not a string.");
+            goto fail;
+        }
+
+        dbus_message_iter_get_basic(&iter, &key);
+
+        if (!dbus_message_iter_next(&iter)) {
+            pa_log("Property value missing");
+            goto fail;
+        }
+
+        dbus_message_iter_recurse(&iter, &variant);
+
+        if (dbus_message_iter_get_arg_type(&variant) == DBUS_TYPE_STRING) {
+            const char *value;
+            dbus_message_iter_get_basic(&variant, &value);
+
+            if (pa_streq(key, "State")) {
+                pa_log_debug("dbus: AudioSource property 'State' changed to value '%s'", value);
+                state = pa_bt_audio_state_from_string(value);
+            }
+        }
+
+        switch(state) {
+            case PA_BT_AUDIO_STATE_INVALID:
+            case PA_BT_AUDIO_STATE_DISCONNECTED:
+            case PA_BT_AUDIO_STATE_CONNECTED:
+            case PA_BT_AUDIO_STATE_CONNECTING:
+                goto fail;
+
+            case PA_BT_AUDIO_STATE_PLAYING:
+                if (u->card) {
+                    pa_log_debug("Changing profile to a2dp_source");
+                    if (pa_card_set_profile(u->card, "a2dp_source", FALSE) < 0)
+                        pa_log("Failed to change profile to a2dp_source");
+                }
+                break;
+        }
     }
 
 fail:
