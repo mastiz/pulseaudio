@@ -2798,12 +2798,13 @@ static int add_card(struct userdata *u, const pa_bluetooth_device *device) {
     *d = PROFILE_OFF;
     pa_hashmap_put(data.profiles, p->name, p);
 
-    if ((default_profile = pa_modargs_get_value(u->modargs, "profile", NULL))) {
-        if (pa_hashmap_get(data.profiles, default_profile))
-            pa_card_new_data_set_profile(&data, default_profile);
-        else
-            pa_log_warn("Profile '%s' not valid or not supported by device.", default_profile);
-    }
+    if ((default_profile = pa_modargs_get_value(u->modargs, "profile", NULL)) == NULL)
+	default_profile = "off";
+
+    if (pa_hashmap_get(data.profiles, default_profile))
+        pa_card_new_data_set_profile(&data, default_profile);
+    else
+        pa_log_warn("Profile '%s' not valid or not supported by device.", default_profile);
 
     u->card = pa_card_new(u->core, &data);
     pa_card_new_data_done(&data);
