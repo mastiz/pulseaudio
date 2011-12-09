@@ -46,7 +46,6 @@
 #include <pulsecore/thread-mq.h>
 #include <pulsecore/poll.h>
 #include <pulsecore/rtpoll.h>
-#include <pulsecore/time-smoother.h>
 #include <pulsecore/namereg.h>
 #include <pulsecore/dbus-shared.h>
 
@@ -163,7 +162,6 @@ struct userdata {
 
     uint64_t read_index, write_index;
     pa_usec_t started_at;
-    pa_smoother *read_smoother;
 
     pa_memchunk write_memchunk;
 
@@ -230,16 +228,6 @@ static int setup_stream(struct userdata *u) {
     u->read_index = u->write_index = 0;
     u->started_at = 0;
 
-    if (u->source)
-        u->read_smoother = pa_smoother_new(
-                PA_USEC_PER_SEC,
-                PA_USEC_PER_SEC*2,
-                TRUE,
-                TRUE,
-                10,
-                pa_rtclock_now(),
-                TRUE);
-
     return 0;
 }
 
@@ -269,11 +257,6 @@ static void bt_transport_release(struct userdata *u) {
     if (u->stream_fd >= 0) {
         pa_close(u->stream_fd);
         u->stream_fd = -1;
-    }
-
-    if (u->read_smoother) {
-        pa_smoother_free(u->read_smoother);
-        u->read_smoother = NULL;
     }
 
     if (u->write_memchunk.memblock) {
@@ -367,14 +350,7 @@ static int sink_process_msg(pa_msgobject *o, int code, void *data, int64_t offse
 
         case PA_SINK_MESSAGE_GET_LATENCY: {
 
-            if (u->read_smoother) {
-                pa_usec_t wi, ri;
-
-                ri = pa_smoother_get(u->read_smoother, pa_rtclock_now());
-                wi = pa_bytes_to_usec(u->write_index + u->block_size, &u->sample_spec);
-
-                *((pa_usec_t*) data) = wi > ri ? wi - ri : 0;
-            } else {
+            {
                 pa_usec_t ri, wi;
 
                 ri = pa_rtclock_now() - u->started_at;
@@ -416,8 +392,6 @@ static int source_process_msg(pa_msgobject *o, int code, void *data, int64_t off
                         bt_transport_release(u);
                     }
 
-                    if (u->read_smoother)
-                        pa_smoother_pause(u->read_smoother, pa_rtclock_now());
                     break;
 
                 case PA_SOURCE_IDLE:
@@ -442,15 +416,7 @@ static int source_process_msg(pa_msgobject *o, int code, void *data, int64_t off
             break;
 
         case PA_SOURCE_MESSAGE_GET_LATENCY: {
-            pa_usec_t wi, ri;
-
-            if (u->read_smoother) {
-                wi = pa_smoother_get(u->read_smoother, pa_rtclock_now());
-                ri = pa_bytes_to_usec(u->read_index, &u->sample_spec);
-
-                *((pa_usec_t*) data) = (wi > ri ? wi - ri : 0) + u->source->thread_info.fixed_latency;
-            } else
-                *((pa_usec_t*) data) = 0;
+            *((pa_usec_t*) data) = 0;
 
             return 0;
         }
@@ -551,7 +517,6 @@ static int hsp_process_push(struct userdata *u) {
     pa_assert(u);
     pa_assert(u->profile == PROFILE_HSP || u->profile == PROFILE_HFGW);
     pa_assert(u->source);
-    pa_assert(u->read_smoother);
 
     memchunk.memblock = pa_memblock_new(u->core->mempool, u->block_size);
     memchunk.index = memchunk.length = 0;
@@ -563,8 +528,6 @@ static int hsp_process_push(struct userdata *u) {
         struct cmsghdr *cm;
         uint8_t aux[1024];
         struct iovec iov;
-        pa_bool_t found_tstamp = FALSE;
-        pa_usec_t tstamp;
 
         memset(&m, 0, sizeof(m));
         memset(&aux, 0, sizeof(aux));
@@ -605,18 +568,8 @@ static int hsp_process_push(struct userdata *u) {
             if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SO_TIMESTAMP) {
                 struct timeval *tv = (struct timeval*) CMSG_DATA(cm);
                 pa_rtclock_from_wallclock(tv);
-                tstamp = pa_timeval_load(tv);
-                found_tstamp = TRUE;
                 break;
             }
-
-        if (!found_tstamp) {
-            pa_log_warn("Couldn't find SO_TIMESTAMP data in auxiliary recvmsg() data!");
-            tstamp = pa_rtclock_now();
-        }
-
-        pa_smoother_put(u->read_smoother, tstamp, pa_bytes_to_usec(u->read_index, &u->sample_spec));
-        pa_smoother_resume(u->read_smoother, tstamp, TRUE);
 
         pa_source_post(u->source, &memchunk);
 
@@ -782,14 +735,11 @@ static int a2dp_process_push(struct userdata *u) {
     pa_assert(u);
     pa_assert(u->profile == PROFILE_A2DP_SOURCE);
     pa_assert(u->source);
-    pa_assert(u->read_smoother);
 
     memchunk.memblock = pa_memblock_new(u->core->mempool, u->block_size);
     memchunk.index = memchunk.length = 0;
 
     for (;;) {
-        pa_bool_t found_tstamp = FALSE;
-        pa_usec_t tstamp;
         struct a2dp_info *a2dp;
         struct rtp_header *header;
         struct rtp_payload *payload;
@@ -825,15 +775,6 @@ static int a2dp_process_push(struct userdata *u) {
         pa_assert((size_t) l <= a2dp->buffer_size);
 
         u->read_index += (uint64_t) l;
-
-        /* TODO: get timestamp from rtp */
-        if (!found_tstamp) {
-            /* pa_log_warn("Couldn't find SO_TIMESTAMP data in auxiliary recvmsg() data!"); */
-            tstamp = pa_rtclock_now();
-        }
-
-        pa_smoother_put(u->read_smoother, tstamp, pa_bytes_to_usec(u->read_index, &u->sample_spec));
-        pa_smoother_resume(u->read_smoother, tstamp, TRUE);
 
         p = (uint8_t*) a2dp->buffer + sizeof(*header) + sizeof(*payload);
         to_decode = l - sizeof(*header) - sizeof(*payload);
@@ -1804,11 +1745,6 @@ static void stop_thread(struct userdata *u) {
         pa_rtpoll_free(u->rtpoll);
         u->rtpoll = NULL;
     }
-
-    if (u->read_smoother) {
-        pa_smoother_free(u->read_smoother);
-        u->read_smoother = NULL;
-    }
 }
 
 /* Run from main thread */
@@ -2362,9 +2298,6 @@ void pa__done(pa_module *m) {
 
     if (u->card)
         pa_card_free(u->card);
-
-    if (u->read_smoother)
-        pa_smoother_free(u->read_smoother);
 
     if (u->a2dp.buffer)
         pa_xfree(u->a2dp.buffer);
