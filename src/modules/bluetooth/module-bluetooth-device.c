@@ -2007,7 +2007,8 @@ static int sco_over_pcm_state_update(struct userdata *u, pa_bool_t changed) {
         if (u->service_fd >= 0 && u->stream_fd >= 0)
             return 0;
 
-        init_bt(u);
+        if (init_bt(u) < 0)
+            return -1;
 
         pa_log_debug("Resuming SCO over PCM");
         if (init_profile(u) < 0) {
@@ -2376,6 +2377,9 @@ static int init_bt(struct userdata *u) {
     u->service_write_type = 0;
     u->service_read_type = 0;
 
+    if (u->profile == PROFILE_OFF)
+        return 0;
+
     if ((u->service_fd = bt_audio_service_open()) < 0) {
         pa_log_warn("Bluetooth audio service not available");
         return -1;
@@ -2665,10 +2669,12 @@ static int card_set_profile(pa_card *c, pa_card_profile *new_profile) {
     if (USE_SCO_OVER_PCM(u))
         save_sco_volume_callbacks(u);
 
-    init_bt(u);
-
-    if (u->profile != PROFILE_OFF)
-        init_profile(u);
+    if (u->profile != PROFILE_OFF) {
+        if (init_bt(u) < 0)
+            u->profile = PROFILE_OFF;
+        else
+            init_profile(u);
+    }
 
     if (u->sink || u->source)
         start_thread(u);
@@ -2999,7 +3005,8 @@ int pa__init(pa_module* m) {
     pa_xfree(mike);
 
     /* Connect to the BT service */
-    init_bt(u);
+    if (init_bt(u) < 0)
+	u->profile = PROFILE_OFF;
 
     if (u->profile != PROFILE_OFF)
         if (init_profile(u) < 0)
